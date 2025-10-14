@@ -1,0 +1,399 @@
+---
+title : "MiSTE 'Dynamique des poissons des rivières'"
+subtitle: "Préparation des données"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+#  bookdown::word_document2
+always_allow_html: true
+params:
+  start_year: 2013
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup
+
+## Load packages and functions
+
+```{r}
+# if necessary
+# devtools::install_github("pascalirz/aspe")
+library(aspe)
+library(tidyverse)
+
+# install custom functions
+# source("../R/functions.R")
+```
+
+## Load data
+
+```{r}
+# retrieve most recent data file from repo 
+rdata_tables <- misc_nom_dernier_fichier(
+  repertoire = "../../../../../projets/ASPE/raw_data/do_not_delete_fbi_trend_version_do_not_delete",
+  pattern = "^tables")
+# load it
+load(rdata_tables)
+```
+
+Data file : `r str_replace(rdata_tables, "../../../../projets/ASPE/raw_data/rdata/", "")`
+
+# Assembly of datasets
+
+From the overall dataset of the Aspe database, only 3 monitoring networks are considered here.
+
+-   Réseau de Contrôle de Surveillance (RCS)
+-   Réseau Hydrobiologique Piscicole (RHP)
+-   Réseau de Référence Pérenne (RRP)
+
+The former two are considered representative of the diversity of the rivers ecosystems in continental France. The RRP (perennial reference network) encompasses only minimally-impacted sites.
+
+Note that one site can contribute to more than one network (true also for one survey).
+
+The data before 2007 were discarded because there was too much turnover between sites and the field protocols were not settled yet.
+
+## Join tables and filter
+
+### Getting started
+
+We start by creating elementary_samples "gateway" dataframe connecting tables ids + additional variables.
+
+This dataframe is then filtered to keep only:
+
+-   the surveys belonging to the representative and reference networks
+-   since 2007 for the monitoring networks and since `r params$refnet_start` for the reference network
+-   with FBI rating
+
+The selected sampling networks (=aims) are:
+
+```{r}
+my_aims <- c("RCS – Réseau de Contrôle de Surveillance",
+             "RHP – Réseau Hydrobiologique Piscicole",
+             "RRP – Réseau de Référence Pérenne")
+```
+
+Assembly and filtering of the dataset.
+
+```{r}
+elementary_samples <- mef_creer_passerelle() %>% 
+  select(sta_id:pre_id) %>% # remove the unnecessary variables
+  distinct() %>% # remove duplicates due to multiple fish batches per survey
+  mef_ajouter_ope_date() %>% 
+  mef_ajouter_objectif() %>% 
+  mef_ajouter_ipr() %>% 
+  filter(annee > 2006,
+     #    annee < 2023,
+         obj_libelle %in% my_aims,
+         !is.na(ipr), 
+         !(obj_libelle == "RRP – Réseau de Référence Pérenne" &
+             annee < params$refnet_start))
+
+if(!is.null(params$depts)) {
+  
+  depts <- as.character(params$depts)
+  
+  elementary_samples <- elementary_samples %>% 
+    mef_ajouter_dept() %>% 
+    filter(dept %in% depts)
+  
+}
+```
+
+A few sites have multiple surveys some years. We keep only the last (autumn) one.
+
+```{r}
+elementary_samples <- elementary_samples %>% 
+  group_by(pop_id, annee, obj_libelle) %>% 
+  filter(ope_date == max(ope_date)) %>%   # only last date for sites sampled more than once a year
+  ungroup()
+```
+
+### Sampling points
+
+3 categories of points:
+
+-   Reference only (all surveys belong to the reference network)
+-   Reference sometimes (at least one survey belongs to the reference network)
+-   Never reference (none of the surveys belongs to the reference network)
+
+```{r}
+points <- elementary_samples %>% 
+  select(pop_id,
+         ope_id,
+         obj_libelle) %>%
+  distinct() %>% 
+  group_by(pop_id,
+           obj_libelle) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(obj_libelle = str_sub(obj_libelle, start = 1, end = 3)) %>% 
+  pivot_wider(names_from = obj_libelle,
+              values_from = n)
+
+# check -> must be 0
+# points %>% count(pop_id) %>% filter(n > 1)
+```
+
+How many years has each site been sampled and tagged as reference?
+
+```{r}
+points %>%
+  count(RRP) %>%
+  ggplot(aes(x = RRP, y = n)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Nb yearly surveys tagged 'reference'",
+       y = "Nb of sites") +
+  geom_vline(xintercept = 4.5, 
+             col = "red", 
+             linetype = "dashed") +
+  scale_x_continuous(breaks = scales::pretty_breaks())
+```
+
+The majority of the `r points %>% filter(RRP > 0) %>% nrow()` sites that have been tagged as "reference" at least once have been sampled at least 9 different years. This is in agreement with the theoretical yearly sampling of the sites of the "RRP". However, it is known that the instructions given to the staff in charge of entering the data in the Aspe database are not so clear as how this tagging has to be done.
+
+For example, some sites are sampled annually for belonging to the RRP and each 2 years for belonging to the RCS. In this case, the surveys should theoretically be alternatively tagged "RRP" and both "RRP" **and** "RCS". In practice there are numerous cases where the alternance is between "RRP" and "RCS".
+
+Hence, the sites that have been tagged at least once every 2 years as "RRP" are considered OK. The others may not have been sampled throughout the period, so they are removed.
+
+```{r}
+point_ids_refnet <- points %>% 
+  filter(RRP > 4) %>% 
+  pull(pop_id)
+
+points <- points %>% 
+  mutate(RRP = ifelse(pop_id %in% point_ids_refnet,
+                      RRP,
+                      NA))
+```
+
+```{r}
+points <- points %>% 
+  mutate(point_ref_type = case_when(
+    !is.na(RRP) & is.na(RHP) & is.na(RCS) ~ "ref_only",
+    is.na(RRP) ~ "never_ref",
+    TRUE ~ "sometimes_ref"
+  ))
+
+n_surveys_by_point <- elementary_samples %>% 
+  group_by(pop_id) %>% 
+  summarise(n_ope = n_distinct(ope_id)) %>% 
+  ungroup()
+
+points <- points %>% 
+  left_join(y = n_surveys_by_point)
+```
+
+A sample of the "points" dataframe:
+
+```{r}
+flextable::flextable(rbind(head(points),
+                           head(points %>% filter(RRP > 0))) %>% 
+  sample_n(10) %>% 
+  arrange(-n_ope)) %>% 
+  flextable::colformat_int(j = 1, big.mark = " ") %>% 
+  flextable::theme_zebra()
+```
+
+Based on the 3 types of points above, we categorise them into 2 types corresponding to the Venn diagram, i.e. "Reference" and "Non-reference".
+
+```{r}
+points_ref_status <- points %>%
+  select(-point_ref_type) %>%
+  pivot_longer(RCS:RRP,
+               names_to = "network") %>%
+  filter(!is.na(value)) %>%
+  select(-value) %>%
+  mutate(
+    reference_status = ifelse(network == "RRP",
+                              "REFNET",
+                              NA),
+    reference_status = ifelse(network %in% c("RHP", "RCS"),
+                              "REPNET",
+                              reference_status)
+  ) 
+
+table(points_ref_status$network, points_ref_status$reference_status)
+
+points_ref_status_2_cats <- points_ref_status %>% 
+  select(-network) %>% 
+  rename(network = reference_status) %>% 
+  distinct()
+```
+
+### Surveys
+
+```{r}
+surveys <- elementary_samples %>% 
+  select(sta_id:ope_id,
+         ope_date,
+         annee) %>% 
+  distinct()
+
+surveys %>% 
+  head() %>% 
+  mutate(across(where(is.numeric), as.character)) %>% 
+  flextable::flextable()
+```
+
+# Data selection
+
+At this stage we kept two kinds of sampling points:
+
+-   Those in REFNET, identified above
+-   Those that are in the other two networks (REPNET)
+
+We now want to omit the REPNET points that do not meet the following requirements: 
+
+-  first survey before 2009, 
+-  last one after 2020, 
+-  minimum 7 annual surveys.
+
+## Points with enough data
+
+```{r}
+points_with_enough_data <- surveys %>% 
+  group_by(pop_id) %>% 
+  summarise(n_years = n_distinct(annee),
+            first_year = min(annee),
+            last_year = max(annee)) %>% 
+  filter(first_year < 2009 &
+         last_year > 2020 &
+         n_years > 6)
+
+# little checks
+table(points_with_enough_data$first_year)
+table(points_with_enough_data$last_year)
+table(points_with_enough_data$n_years)
+```
+
+Ids of the points with enough data
+
+```{r}
+ids_points_with_enough_data <- points_with_enough_data %>% 
+  pull(pop_id) 
+```
+
+## Final data selection
+
+We keep the sampling points either that have been surveyed frequently or that are "reference" sites.
+
+### Points
+
+```{r}
+ids_pops_refnet <- points %>%
+  filter(!is.na(RRP)) %>%
+  pull(pop_id)
+
+ids_points <- c(ids_points_with_enough_data,
+                ids_pops_refnet) %>% 
+  unique() # in case some points are duplicated
+
+points <- points %>% 
+  filter(pop_id %in% ids_points)
+```
+
+We then identify the sites that are not shared between REFNET and REPNET to allow to check that some trends are not related to the networks common sites.
+
+```{r}
+n_cats <- points_ref_status %>% 
+  filter(pop_id %in% ids_points) 
+
+n_distinct(n_cats$pop_id)
+
+pop_id_exclusive_network <- n_cats %>% 
+  group_by(pop_id) %>% 
+  summarise(n_networks = n_distinct(reference_status)) %>% 
+  filter(n_networks == 1) %>% 
+  pull(pop_id)
+```
+
+### Surveys
+
+```{r}
+surveys <- surveys %>% 
+  filter(pop_id %in% ids_points)
+```
+
+# Key figures of the dataset
+
+```{r}
+nb_sites <- nrow(points)
+nb_surveys <- nrow(surveys)
+```
+
+```{r}
+library(VennDiagram)
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+ids_pops_refnet <- points %>%
+  filter(!is.na(RRP)) %>%
+  pull(pop_id)
+
+ids_pops_repnet <- points %>%
+  filter(!is.na(RHP) | !is.na(RCS)) %>%
+  pull(pop_id)
+
+venn <- venn.diagram(
+  x = list(ids_pops_refnet,
+           ids_pops_repnet),
+  category.names = c("REFNET",
+                     "REPNET"),
+  fill = c("green3", "brown"),
+  cat.col = c("green3", "brown"),
+  filename = NULL,
+  cat.dist = 0.1,
+  margin = 0.5,
+  disable.logging = TRUE
+)
+
+grid::grid.draw(venn)
+```
+
+# Spatialise sampling points
+
+The dataframe of the selected sampling points is transformed into a spatial object of class `sf`.
+
+```{r}
+points_geo <- point_prelevement %>%
+  filter(pop_id %in% ids_points) %>%
+  left_join(y = ref_type_projection,
+            by = c("pop_typ_id" = "typ_id")) %>%
+  geo_convertir_coords_df(
+    var_x = pop_coordonnees_x,
+    var_y = pop_coordonnees_y,
+    var_id = pop_id,
+    var_crs_initial = typ_code_epsg,
+    crs_sortie = 4326
+  ) %>%
+  rename(x_wgs84 = X,
+         y_wgs84 = Y) %>%
+  sf::st_as_sf(coords = c("x_wgs84", "y_wgs84"),
+               crs = 4326) %>%
+  left_join(y = points) %>% 
+  left_join(y = points_ref_status_2_cats)
+```
+
+# Saving
+
+```{r}
+save(rdata_tables,
+     elementary_samples,
+     surveys,
+     ids_points,
+     points,
+     points_ref_status_2_cats,
+     pop_id_exclusive_network,
+     points_geo,
+     file = "../processed_data/20_selected_data.RData")
+
+save(venn,
+     nb_sites,
+     nb_surveys,
+     file = "../processed_data/key_figures.RData")
+```
